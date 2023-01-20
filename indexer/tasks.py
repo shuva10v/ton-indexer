@@ -6,6 +6,8 @@ import os
 import json
 import traceback
 import queue
+from datetime import datetime
+import pika
 
 from pathlib import Path
 
@@ -48,6 +50,8 @@ class IndexWorker():
                                    tonlib_timeout=60)
 
         loop.run_until_complete(self.client.init())
+        self.broker_connection = None
+        self.broker_channel = None
 
     async def _get_block_with_shards(self, seqno):
         master_block = await self.client.lookup_block(MASTERCHAIN_INDEX, MASTERCHAIN_SHARD, seqno)
@@ -186,8 +190,71 @@ class IndexWorker():
             return self._get_raw_info_ext(seqno)
         return self._get_raw_info(seqno)
 
+    def get_pika_channel(self):
+        if self.broker_channel is None:
+            self.broker_connection = pika.BlockingConnection(pika.ConnectionParameters(settings.indexer.push_accounts_update_broker))
+            self.broker_channel = self.broker_connection.channel()
+        return self.broker_channel
+
+    async def push_accounts(self, transactions, seqno):
+        if not settings.indexer.push_accounts_update_enabled:
+            return
+        accounts = set()
+        tx_utime_min = None
+        tx_utime_max = None
+
+        def add_workchain(a):
+            if a.startswith("EQ"):
+                accounts.add(a)
+
+        for tx_block in transactions:
+            for tx_raw in tx_block:
+                tx_details_raw = tx_raw[1]
+                utime = tx_details_raw['utime']
+                if tx_utime_max is None or utime > tx_utime_max:
+                    tx_utime_max = utime
+                if tx_utime_min is None or utime < tx_utime_min:
+                    tx_utime_min = utime
+                if 'in_msg' in tx_details_raw:
+                    raw = tx_details_raw['in_msg']
+                    add_workchain(raw['source'])
+                    add_workchain(raw['destination'])
+                for raw in tx_details_raw['out_msgs']:
+                    add_workchain(raw['source'])
+                    add_workchain(raw['destination'])
+        if len(accounts) == 0:
+            return
+        logger.info(f"txs with seqno {seqno} has {len(accounts)} accounts within")
+        msg = {
+            'accounts': list(accounts),
+            'created': int(datetime.today().timestamp()),
+            'tx_utime_min': tx_utime_min,
+            'tx_utime_max': tx_utime_max,
+            'seqno': seqno
+        }
+        logger.info(f"Tx info: {msg}")
+        try:
+            channel = self.get_pika_channel()
+            channel.basic_publish(exchange='',
+                                  routing_key='accounts_stream',
+                                  body=json.dumps(msg))
+        except Exception as ee:
+            logger.error(f'Failed to push message: {traceback.format_exc()}')
+            try:
+                self.broker_channel.close()
+                self.broker_connection.close()
+            except:
+                pass
+            self.broker_channel = None
+
+
     async def process_mc_seqno(self, seqno: int):
         blocks, headers, transactions = await self.get_raw_info(seqno)
+        try:
+            await self.push_accounts(transactions, seqno)
+        except Exception as ee:
+            logger.warning(f'Failed to push accounts: {traceback.format_exc()}')
+
         try:
             await insert_by_seqno_core(engine, blocks, headers, transactions)
             logger.info(f'Block(seqno={seqno}) inserted')
